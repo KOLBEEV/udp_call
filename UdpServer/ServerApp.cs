@@ -2,25 +2,32 @@ using System.Net;
 using System.Text;
 using UdpCommon;
 
-namespace UdpClientApp;
+namespace UdpServer;
 
-public sealed class ClientApp : IDisposable
+public sealed class ServerApp : IDisposable
 {
     private readonly UdpPeer _udpPeer;
-    private readonly IPEndPoint _serverEndPoint;
 
     private readonly PacketFactory _packetFactory = new();
     private readonly PingTracker _pingTracker = new();
     private readonly PacketOrderTracker _packetOrderTracker = new();
 
+    private IPEndPoint? _clientEndPoint = null;
+
+    public ServerApp(int localPort)
+    {
+        _udpPeer = new UdpPeer(localPort);
+    }
+
     public async Task RunAsync(CancellationTokenSource cancellationTokenSource)
     {
-        Console.WriteLine($"Клиент запущен на порту {_udpPeer.LocalPort}");
-        Console.WriteLine($"Сервер: {_serverEndPoint.Address}:{_serverEndPoint.Port}");
+        Console.WriteLine($"Сервер запущен на порту {_udpPeer.LocalPort}");
+        Console.WriteLine("Сначала клиент должен отправить первое сообщение.");
+        Console.WriteLine("После этого сервер сможет ему отвечать.");
         Console.WriteLine();
         Console.WriteLine("Команды:");
-        Console.WriteLine("  обычный текст  - отправить сообщение");
-        Console.WriteLine("  /ping          - измерить RTT до сервера");
+        Console.WriteLine("  обычный текст  - отправить сообщение клиенту");
+        Console.WriteLine("  /ping          - измерить RTT до клиента");
         Console.WriteLine("  /ping5         - отправить 5 ping-пакетов");
         Console.WriteLine("  /exit          - выйти");
         Console.WriteLine();
@@ -31,12 +38,6 @@ public sealed class ClientApp : IDisposable
         await Task.WhenAll(receiveTask, inputTask);
     }
 
-    public ClientApp(int localPort, string serverIp, int serverPort)
-    {
-        _udpPeer = new UdpPeer(localPort);
-        _serverEndPoint = new IPEndPoint(IPAddress.Parse(serverIp), serverPort);
-    }
-
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -44,6 +45,8 @@ public sealed class ClientApp : IDisposable
             try
             {
                 ReceivedUdpPacket received = await _udpPeer.ReceiveAsync(cancellationToken);
+
+                _clientEndPoint = received.RemoteEndPoint;
 
                 await HandleIncomingPacketAsync(received);
             }
@@ -79,19 +82,25 @@ public sealed class ClientApp : IDisposable
                 break;
             }
 
+            if (_clientEndPoint is null)
+            {
+                Console.WriteLine("Я ещё не знаю адрес клиента. Сначала клиент должен отправить сообщение.");
+                continue;
+            }
+
             if (input == "/ping")
             {
-                await SendPingAsync();
+                await SendPingAsync(_clientEndPoint);
                 continue;
             }
 
             if (input == "/ping5")
             {
-                await SendPingSeveralTimesAsync(5);
+                await SendPingSeveralTimesAsync(_clientEndPoint, 5);
                 continue;
             }
 
-            await SendTextAsync(input);
+            await SendTextAsync(input, _clientEndPoint);
         }
     }
 
@@ -106,7 +115,10 @@ public sealed class ClientApp : IDisposable
             string message = Encoding.UTF8.GetString(packet.Payload);
 
             Console.WriteLine();
-            Console.WriteLine($"Сервер [{packet.SequenceNumber}]: {message}");
+            Console.WriteLine(
+                $"Клиент {received.RemoteEndPoint.Address}:{received.RemoteEndPoint.Port} " +
+                $"[{packet.SequenceNumber}]: {message}"
+            );
             Console.Write("> ");
 
             return;
@@ -129,31 +141,31 @@ public sealed class ClientApp : IDisposable
         Console.Write("> ");
     }
 
-    private async Task SendTextAsync(string message)
+    private async Task SendTextAsync(string message, IPEndPoint remoteEndPoint)
     {
         UdpPacket packet = _packetFactory.CreateText(message);
 
-        int sentBytes = await _udpPeer.SendAsync(packet, _serverEndPoint);
+        int sentBytes = await _udpPeer.SendAsync(packet, remoteEndPoint);
 
         Console.WriteLine($"Отправлен Text #{packet.SequenceNumber}, байт: {sentBytes}");
     }
-    
-    private async Task SendPingAsync()
+
+    private async Task SendPingAsync(IPEndPoint remoteEndPoint)
     {
         UdpPacket packet = _packetFactory.CreatePing();
 
         _pingTracker.RegisterPing(packet);
 
-        int sentBytes = await _udpPeer.SendAsync(packet, _serverEndPoint);
+        int sentBytes = await _udpPeer.SendAsync(packet, remoteEndPoint);
 
         Console.WriteLine($"Отправлен Ping #{packet.SequenceNumber}, байт: {sentBytes}");
     }
 
-    private async Task SendPingSeveralTimesAsync(int count)
+    private async Task SendPingSeveralTimesAsync(IPEndPoint remoteEndPoint, int count)
     {
         for (int i = 0; i < count; i++)
         {
-            await SendPingAsync();
+            await SendPingAsync(remoteEndPoint);
             await Task.Delay(500);
         }
     }
@@ -188,7 +200,7 @@ public sealed class ClientApp : IDisposable
 
         Console.WriteLine($"Получен Pong #{pongPacket.SequenceNumber}");
         Console.WriteLine($"RTT: {rttMilliseconds} мс");
-        Console.WriteLine($"Примерная задержка в отдну сторону: {rttMilliseconds / 2.0:F1}");
+        Console.WriteLine($"Примерная задержка в одну сторону: {rttMilliseconds / 2.0:F1} мс");
         Console.Write("> ");
     }
 

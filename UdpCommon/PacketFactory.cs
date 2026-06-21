@@ -28,7 +28,7 @@ public sealed class PacketFactory
         );
     }
 
-    public UdpPacket CreatePing(UdpPacket pingPacket)
+    public UdpPacket CreatePong(UdpPacket pingPacket)
     {
         return new UdpPacket(
             PacketType.Pong,
