@@ -1,21 +1,24 @@
 using System.Net;
-using System.Text;
 using UdpCommon;
 
 namespace UdpClientApp;
 
 public sealed class ClientApp : IDisposable
 {
-    private readonly UdpPeer _udpPeer;
+    private readonly UdpSession _session;
     private readonly IPEndPoint _serverEndPoint;
 
-    private readonly PacketFactory _packetFactory = new();
-    private readonly PingTracker _pingTracker = new();
-    private readonly PacketOrderTracker _packetOrderTracker = new();
+    public ClientApp(int localPort, string serverIp, int serverPort)
+    {
+        _session = new UdpSession(localPort);
+
+        _serverEndPoint = new IPEndPoint(IPAddress.Parse(serverIp), serverPort);
+    }
+
 
     public async Task RunAsync(CancellationTokenSource cancellationTokenSource)
     {
-        Console.WriteLine($"Клиент запущен на порту {_udpPeer.LocalPort}");
+        Console.WriteLine($"Клиент запущен на порту {_session.LocalPort}");
         Console.WriteLine($"Сервер: {_serverEndPoint.Address}:{_serverEndPoint.Port}");
         Console.WriteLine();
         Console.WriteLine("Команды:");
@@ -31,19 +34,13 @@ public sealed class ClientApp : IDisposable
         await Task.WhenAll(receiveTask, inputTask);
     }
 
-    public ClientApp(int localPort, string serverIp, int serverPort)
-    {
-        _udpPeer = new UdpPeer(localPort);
-        _serverEndPoint = new IPEndPoint(IPAddress.Parse(serverIp), serverPort);
-    }
-
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                ReceivedUdpPacket received = await _udpPeer.ReceiveAsync(cancellationToken);
+                ReceivedUdpPacket received = await _session.ReceiveAsync(cancellationToken);
 
                 await HandleIncomingPacketAsync(received);
             }
@@ -99,80 +96,52 @@ public sealed class ClientApp : IDisposable
     {
         UdpPacket packet = received.Packet;
 
-        PrintPacketOrderInfo(packet.SequenceNumber);
-
-        if (packet.Type == PacketType.Text)
+        switch (packet.Type)
         {
-            string message = Encoding.UTF8.GetString(packet.Payload);
-
-            Console.WriteLine();
-            Console.WriteLine($"Сервер [{packet.SequenceNumber}]: {message}");
-            Console.Write("> ");
-
-            return;
+            case PacketType.Text:
+                HandleText(packet);
+                break;
+            
+            case PacketType.Ping:
+                await HandlePingAsync(packet, received.RemoteEndPoint);
+                break;
+            
+            case PacketType.Pong:
+                HandlePong(packet);
+                break;
+            
+            default:
+                Console.WriteLine();
+                Console.WriteLine($"Получен пакет типа {packet.Type}, номер {packet.SequenceNumber}");
+                Console.Write("> ");
+                break;
         }
+    }
 
-        if (packet.Type == PacketType.Ping)
-        {
-            await SendPongAsync(packet, received.RemoteEndPoint);
-            return;
-        }
+    private void HandleText(UdpPacket packet)
+    {
+        PrintPacketOrderInfo(packet);
 
-        if (packet.Type == PacketType.Pong)
-        {
-            HandlePong(packet);
-            return;
-        }
+        string message = UdpSession.DecodeText(packet);
 
         Console.WriteLine();
-        Console.WriteLine($"Получен пакет типа {packet.Type}, номер {packet.SequenceNumber}");
+        Console.WriteLine($"Сервер [{packet.SequenceNumber}]: {message}");
         Console.Write("> ");
     }
 
-    private async Task SendTextAsync(string message)
+    private async Task HandlePingAsync(UdpPacket pingPacket, IPEndPoint remoteEndPoint)
     {
-        UdpPacket packet = _packetFactory.CreateText(message);
-
-        int sentBytes = await _udpPeer.SendAsync(packet, _serverEndPoint);
-
-        Console.WriteLine($"Отправлен Text #{packet.SequenceNumber}, байт: {sentBytes}");
-    }
-    
-    private async Task SendPingAsync()
-    {
-        UdpPacket packet = _packetFactory.CreatePing();
-
-        _pingTracker.RegisterPing(packet);
-
-        int sentBytes = await _udpPeer.SendAsync(packet, _serverEndPoint);
-
-        Console.WriteLine($"Отправлен Ping #{packet.SequenceNumber}, байт: {sentBytes}");
-    }
-
-    private async Task SendPingSeveralTimesAsync(int count)
-    {
-        for (int i = 0; i < count; i++)
-        {
-            await SendPingAsync();
-            await Task.Delay(500);
-        }
-    }
-
-    private async Task SendPongAsync(UdpPacket pingPacket, IPEndPoint remoteEndPoint)
-    {
-        UdpPacket pongPacket = _packetFactory.CreatePong(pingPacket);
-
-        await _udpPeer.SendAsync(pongPacket, remoteEndPoint);
+        await _session.SendPongAsync(pingPacket, remoteEndPoint);
 
         Console.WriteLine();
         Console.WriteLine($"Получен Ping #{pingPacket.SequenceNumber}");
-        Console.WriteLine($"Отправлен Pong #{pongPacket.SequenceNumber}");
+        Console.WriteLine($"Отправлен Pong #{pingPacket.SequenceNumber}");
         Console.Write("> ");
     }
 
     private void HandlePong(UdpPacket pongPacket)
     {
-        bool found = _pingTracker.TryCompletePing(
+        bool found = _session.TryCompletePong(
             pongPacket,
             out long rttMilliseconds
         );
@@ -192,9 +161,33 @@ public sealed class ClientApp : IDisposable
         Console.Write("> ");
     }
 
-    private void PrintPacketOrderInfo(uint sequenceNumber)
+    private async Task SendTextAsync(string message)
     {
-        PacketOrderResult result = _packetOrderTracker.Check(sequenceNumber);
+        int sentBytes = await _session.SendTextAsync(message, _serverEndPoint);
+
+        Console.WriteLine($"Отправлен Text, байт: {sentBytes}");
+    }
+
+    private async Task SendPingAsync()
+    {
+
+        int sentBytes = await _session.SendPingAsync(_serverEndPoint);
+
+        Console.WriteLine($"Отправлен Ping, байт: {sentBytes}");
+    }
+
+    private async Task SendPingSeveralTimesAsync(int count)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            await SendPingAsync();
+            await Task.Delay(500);
+        }
+    }
+
+    private void PrintPacketOrderInfo(UdpPacket packet)
+    {
+        PacketOrderResult result = _session.CheckPacketOrder(packet);
 
         if (result.State == PacketOrderState.MissingPackets)
         {
@@ -220,6 +213,6 @@ public sealed class ClientApp : IDisposable
 
     public void Dispose()
     {
-        _udpPeer.Dispose();
+        _session.Dispose();
     }
 }
